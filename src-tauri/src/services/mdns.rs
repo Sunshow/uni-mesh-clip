@@ -12,8 +12,7 @@ use uuid::Uuid;
 
 const SERVICE_TYPE: &str = "_unimesh._tcp.local.";
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(10); // Check every 10 seconds
-const ACTIVE_QUERY_INTERVAL: Duration = Duration::from_secs(30); // Active query every 30 seconds
-const DEVICE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes timeout (increased from 60 seconds)
+const DEVICE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes timeout
 
 pub struct MdnsService {
     service_name: String,
@@ -128,7 +127,6 @@ impl MdnsService {
             }
             
             let receiver = receiver.unwrap();
-            let mut last_active_query = Instant::now();
             
             // Immediately trigger an active query when starting
             tracing::info!("Triggering initial active discovery query");
@@ -215,10 +213,10 @@ impl MdnsService {
                                         });
                                     }
                                     ServiceEvent::SearchStarted(service_type) => {
-                                        tracing::debug!("mDNS search started for: {}", service_type);
+                                        tracing::info!("mDNS search started for: {}", service_type);
                                     }
                                     ServiceEvent::SearchStopped(service_type) => {
-                                        tracing::debug!("mDNS search stopped for: {}", service_type);
+                                        tracing::info!("mDNS search stopped for: {}", service_type);
                                     }
                                     _ => {
                                         tracing::debug!("Received other mDNS event: {:?}", event);
@@ -235,17 +233,33 @@ impl MdnsService {
                         }
                     }
                     _ = tokio::time::sleep(DISCOVERY_INTERVAL) => {
+                        // First, always trigger active discovery every 10 seconds
+                        tracing::info!("=== 10-second periodic discovery cycle ===");
+                        tracing::info!("Triggering active discovery query (every {:?})", DISCOVERY_INTERVAL);
+                        
+                        // Create a new browse to actively search for services
+                        match mdns_daemon.browse(&service_type) {
+                            Ok(_) => {
+                                tracing::info!("Successfully triggered active browse - looking for new services");
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to trigger active browse: {}", e);
+                            }
+                        }
+                        
                         // Clean up stale devices - only remove devices that haven't been seen for the timeout period
                         let mut devices_write = devices.write().await;
                         let initial_count = devices_write.len();
                         
                         // First, log all current devices for debugging
                         if initial_count > 0 {
-                            tracing::debug!("Current devices before cleanup ({}): ", initial_count);
+                            tracing::info!("Current devices before cleanup ({}): ", initial_count);
                             for (key, (device, last_seen)) in devices_write.iter() {
-                                tracing::debug!("  - {}: {} ({:?} ago)", 
+                                tracing::info!("  - {}: {} ({:?} ago)", 
                                                key, device.name, last_seen.elapsed());
                             }
+                        } else {
+                            tracing::info!("No devices currently in list");
                         }
                         
                         devices_write.retain(|_key, (device, last_seen)| {
@@ -262,21 +276,10 @@ impl MdnsService {
                             tracing::info!("Device cleanup completed: {} removed, {} remaining (was {}, now {})", 
                                          initial_count - final_count, final_count, initial_count, final_count);
                         } else if initial_count > 0 {
-                            tracing::debug!("No devices removed in cleanup cycle, {} devices still active", initial_count);
+                            tracing::info!("No devices removed in cleanup cycle, {} devices still active", initial_count);
                         }
                         
-                        // Trigger periodic active queries to discover new devices and refresh existing ones
-                        if last_active_query.elapsed() >= ACTIVE_QUERY_INTERVAL {
-                            tracing::debug!("Triggering periodic active discovery query (every {:?})", ACTIVE_QUERY_INTERVAL);
-                            // Create a new browse request to actively search for services
-                            if let Ok(_new_receiver) = mdns_daemon.browse(&service_type) {
-                                tracing::debug!("Successfully triggered active browse");
-                                // The new receiver will be handled by subsequent iterations
-                            } else {
-                                tracing::warn!("Failed to trigger active browse");
-                            }
-                            last_active_query = Instant::now();
-                        }
+                        tracing::info!("=== End of 10-second cycle ===");
                     }
                 }
             }
