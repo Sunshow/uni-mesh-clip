@@ -60,7 +60,6 @@ fn main() {
             commands::stop_sync,
             commands::get_discovered_devices,
             commands::get_sync_status,
-            commands::add_test_device,
             commands::test_connection,
             commands::is_dev_mode,
         ])

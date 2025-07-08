@@ -21,6 +21,7 @@ pub struct MdnsService {
     discovered_devices: Arc<RwLock<HashMap<String, (DiscoveredDevice, Instant)>>>,
     discovery_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     mdns_daemon: Arc<RwLock<Option<ServiceDaemon>>>,
+    local_instance_name: Arc<RwLock<Option<String>>>, // Track our own instance name
 }
 
 impl MdnsService {
@@ -31,6 +32,7 @@ impl MdnsService {
             discovered_devices: Arc::new(RwLock::new(HashMap::new())),
             discovery_handle: Arc::new(RwLock::new(None)),
             mdns_daemon: Arc::new(RwLock::new(None)),
+            local_instance_name: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -67,6 +69,8 @@ impl MdnsService {
         
         let devices = self.discovered_devices.clone();
         let service_type = SERVICE_TYPE.to_string();
+        let local_instance = self.local_instance_name.clone();
+        let local_port = self.port;
         
         let handle = tokio::spawn(async move {
             tracing::info!("Starting mDNS discovery for service: {}", service_type);
@@ -105,6 +109,27 @@ impl MdnsService {
                                                       info.get_addresses().iter().next().unwrap_or(&IpAddr::from([0,0,0,0])), 
                                                       info.get_port());
                                         
+                                        // Check if this is our own service
+                                        let local_instance_name = local_instance.read().await;
+                                        if let Some(ref local_name) = *local_instance_name {
+                                            if info.get_fullname() == local_name {
+                                                tracing::debug!("Ignoring our own service: {}", local_name);
+                                                continue;
+                                            }
+                                        }
+                                        
+                                        // Also check by port - if same port and local IP, it's likely us
+                                        if let Some(addr) = info.get_addresses().iter().next() {
+                                            if info.get_port() == local_port {
+                                                if let Some(local_ip) = Self::get_local_ip() {
+                                                    if addr.to_string() == local_ip.to_string() {
+                                                        tracing::debug!("Ignoring our own service by IP:port match: {}:{}", addr, info.get_port());
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
                                         // Convert to DiscoveredDevice
                                         if let Some(addr) = info.get_addresses().iter().next() {
                                             let device = DiscoveredDevice {
@@ -117,9 +142,16 @@ impl MdnsService {
                                             
                                             let mut devices_write = devices.write().await;
                                             let key = format!("{}:{}", device.address, device.port);
-                                            let device_info = format!("{}:{}", device.address, device.port);
-                                            devices_write.insert(key, (device, Instant::now()));
-                                            tracing::debug!("Added device to discovered list: {}", device_info);
+                                            
+                                            // Check if device already exists, if so update timestamp
+                                            if let Some((existing_device, _)) = devices_write.get_mut(&key) {
+                                                existing_device.last_seen = chrono::Utc::now();
+                                                tracing::debug!("Updated existing device timestamp: {}", key);
+                                            } else {
+                                                let device_info = format!("{}:{}", device.address, device.port);
+                                                devices_write.insert(key, (device, Instant::now()));
+                                                tracing::info!("Added new device to discovered list: {}", device_info);
+                                            }
                                         }
                                     }
                                     ServiceEvent::ServiceRemoved(typ, fullname) => {
@@ -151,15 +183,21 @@ impl MdnsService {
                         }
                     }
                     _ = tokio::time::sleep(DISCOVERY_INTERVAL) => {
-                        // Clean up stale devices
+                        // Clean up stale devices - only remove devices that haven't been seen for the timeout period
                         let mut devices_write = devices.write().await;
                         let initial_count = devices_write.len();
-                        devices_write.retain(|_, (_, last_seen)| {
-                            last_seen.elapsed() < DEVICE_TIMEOUT
+                        devices_write.retain(|_key, (device, last_seen)| {
+                            let should_keep = last_seen.elapsed() < DEVICE_TIMEOUT;
+                            if !should_keep {
+                                tracing::info!("Removing stale device: {} ({}:{}) - last seen {:?} ago", 
+                                             device.name, device.address, device.port, last_seen.elapsed());
+                            }
+                            should_keep
                         });
                         let final_count = devices_write.len();
                         if initial_count != final_count {
-                            tracing::debug!("Cleaned up {} stale devices", initial_count - final_count);
+                            tracing::info!("Cleaned up {} stale devices ({} -> {} devices)", 
+                                         initial_count - final_count, initial_count, final_count);
                         }
                         
                         // Trigger periodic active queries to discover new devices
@@ -246,6 +284,9 @@ impl MdnsService {
             anyhow::anyhow!("Failed to register mDNS service: {}", e)
         })?;
         
+        // Store our instance name to filter it out from discovery
+        *self.local_instance_name.write().await = Some(instance_name.clone());
+        
         tracing::info!("mDNS service published successfully with instance: {}", instance_name);
         
         // Also immediately trigger discovery to find existing services
@@ -262,12 +303,5 @@ impl MdnsService {
             .values()
             .map(|(device, _)| device.clone())
             .collect()
-    }
-    
-    // Manual device registration for testing
-    pub async fn register_device(&self, device: DiscoveredDevice) {
-        let mut devices = self.discovered_devices.write().await;
-        let key = format!("{}:{}", device.address, device.port);
-        devices.insert(key, (device, Instant::now()));
     }
 }

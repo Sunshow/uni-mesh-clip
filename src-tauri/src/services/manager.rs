@@ -109,22 +109,7 @@ impl ServiceManager {
         
         // Add some sample devices for demonstration
         if cfg!(debug_assertions) {
-            use crate::models::DiscoveredDevice;
-            mdns.register_device(DiscoveredDevice {
-                name: "Sample Device 1".to_string(),
-                address: "192.168.1.100".to_string(),
-                port: 8765,
-                last_seen: chrono::Utc::now(),
-                trusted: true,
-            }).await;
-            mdns.register_device(DiscoveredDevice {
-                name: "Sample Device 2".to_string(),
-                address: "192.168.1.101".to_string(),
-                port: 8765,
-                last_seen: chrono::Utc::now(),
-                trusted: false,
-            }).await;
-            tracing::info!("Added sample devices for debugging");
+            tracing::info!("Debug mode - no sample devices added");
         }
         
         self.mdns = Some(mdns.clone());
@@ -279,15 +264,6 @@ impl ServiceManager {
     
     pub async fn is_running(&self) -> bool {
         *self.is_running.read().await
-    }
-    
-    pub async fn add_test_device(&self, device: DiscoveredDevice) -> Result<()> {
-        if let Some(ref mdns) = self.mdns {
-            mdns.register_device(device).await;
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("mDNS service not running"))
-        }
     }
 
     pub async fn get_sync_metrics(&self) -> Option<SyncMetrics> {

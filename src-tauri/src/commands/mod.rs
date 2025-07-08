@@ -42,14 +42,6 @@ pub async fn get_sync_status(state: State<'_, AppState>) -> Result<bool, String>
 }
 
 #[tauri::command]
-#[cfg(any(debug_assertions, feature = "dev-features"))]
-pub async fn add_test_device(device: DiscoveredDevice, state: State<'_, AppState>) -> Result<(), String> {
-    let manager = state.service_manager.lock().await;
-    manager.add_test_device(device).await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub async fn test_connection() -> Result<String, String> {
     Ok("Connection successful".to_string())
 }
