@@ -1,7 +1,7 @@
 use arboard::Clipboard;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, timeout};
 use anyhow::Result;
 
 pub struct ClipboardMonitor {
@@ -10,9 +10,28 @@ pub struct ClipboardMonitor {
 }
 
 impl ClipboardMonitor {
-    pub fn new() -> Result<Self> {
+    pub async fn new() -> Result<Self> {
+        tracing::info!("Initializing clipboard monitor...");
+        
+        // Add timeout to prevent hanging on permission requests
+        let clipboard_result = timeout(Duration::from_secs(5), async {
+            tokio::task::spawn_blocking(|| Clipboard::new()).await
+        }).await;
+        
+        let clipboard = match clipboard_result {
+            Ok(join_result) => match join_result {
+                Ok(clipboard_result) => match clipboard_result {
+                    Ok(clipboard) => clipboard,
+                    Err(e) => return Err(anyhow::anyhow!("Failed to initialize clipboard: {}", e)),
+                },
+                Err(e) => return Err(anyhow::anyhow!("Failed to spawn clipboard task: {}", e)),
+            },
+            Err(_) => return Err(anyhow::anyhow!("Clipboard initialization timed out - this usually means permission is required")),
+        };
+        
+        tracing::info!("Clipboard monitor initialized successfully");
         Ok(Self {
-            clipboard: Arc::new(Mutex::new(Clipboard::new()?)),
+            clipboard: Arc::new(Mutex::new(clipboard)),
             last_content: Arc::new(Mutex::new(None)),
         })
     }

@@ -58,27 +58,17 @@ impl ServiceManager {
     pub async fn start(&mut self) -> Result<()> {
         tracing::info!("Starting services...");
         
-        // Check if already running with detailed logging
-        let current_running = *self.is_running.read().await;
-        if current_running {
-            tracing::warn!("Services are already running, skipping start");
-            return Ok(());
-        }
-
-        // Double-check with a write lock to prevent race conditions
+        // Check if already running
         {
-            let mut running_lock = self.is_running.write().await;
+            let running_lock = self.is_running.read().await;
             if *running_lock {
-                tracing::warn!("Services started by another thread, skipping");
+                tracing::warn!("Services are already running, skipping start");
                 return Ok(());
             }
-            
-            // Mark as starting to prevent other threads from starting
-            *running_lock = true;
         }
 
-        // If we get here, we're the only thread starting services
-        let config = self.config.read().await;
+        // Get config outside of critical section
+        let config = self.config.read().await.clone();
         tracing::info!("Starting with config: websocket_port={}, mdns_service_name={}", 
                       config.websocket_port, config.mdns_service_name);
         
@@ -92,13 +82,12 @@ impl ServiceManager {
             }
             Err(e) => {
                 tracing::error!("Failed to start WebSocket server: {}", e);
-                // Reset running state on failure
-                *self.is_running.write().await = false;
                 return Err(e);
             }
         }
         
         // Start mDNS service
+        tracing::info!("Starting mDNS service...");
         let mdns = Arc::new(MdnsService::new(
             config.mdns_service_name.clone(),
             config.websocket_port,
@@ -107,11 +96,15 @@ impl ServiceManager {
         if let Err(e) = mdns.start_discovery().await {
             tracing::error!("Failed to start mDNS discovery: {}", e);
             // Don't fail completely, just log the error
+        } else {
+            tracing::info!("mDNS discovery started successfully");
         }
         
         if let Err(e) = mdns.publish_service().await {
             tracing::error!("Failed to publish mDNS service: {}", e);
             // Don't fail completely, just log the error
+        } else {
+            tracing::info!("mDNS service published successfully");
         }
         
         // Add some sample devices for demonstration
@@ -131,19 +124,21 @@ impl ServiceManager {
                 last_seen: chrono::Utc::now(),
                 trusted: false,
             }).await;
+            tracing::info!("Added sample devices for debugging");
         }
         
         self.mdns = Some(mdns.clone());
         
-        // Start clipboard monitor
-        match ClipboardMonitor::new() {
+        // Start clipboard monitor with proper error handling
+        tracing::info!("Initializing clipboard monitor...");
+        match ClipboardMonitor::new().await {
             Ok(monitor) => {
                 let clipboard = Arc::new(monitor);
                 let ws_for_clipboard = self.websocket.as_ref().unwrap().clone();
                 let security_key = config.security_key.clone();
                 
                 // Start monitoring (it spawns its own task internally)
-                if let Err(e) = clipboard.start_monitoring(move |content| {
+                match clipboard.start_monitoring(move |content| {
                     let ws = ws_for_clipboard.clone();
                     let key = security_key.clone();
                     tokio::spawn(async move {
@@ -173,21 +168,31 @@ impl ServiceManager {
                         }
                     });
                 }).await {
-                    tracing::error!("Failed to start clipboard monitoring: {}", e);
+                    Ok(_) => {
+                        self.clipboard = Some(clipboard);
+                        tracing::info!("Clipboard monitoring started successfully");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to start clipboard monitoring: {}", e);
+                        // Continue without clipboard monitoring - don't fail the whole startup
+                    }
                 }
-                
-                self.clipboard = Some(clipboard);
             }
             Err(e) => {
                 tracing::error!("Failed to initialize clipboard monitor: {}. Clipboard sync will be disabled.", e);
-                // Continue without clipboard monitoring
+                tracing::warn!("This is often due to missing clipboard permissions. The application will continue to work for device discovery and manual sync.");
+                // Continue without clipboard monitoring - the app can still function for network sync
             }
         }
         
+        // All services started successfully - now mark as running and update config
+        *self.is_running.write().await = true;
+        
         // Update config to reflect running state
-        let mut config_write = self.config.write().await;
-        config_write.sync_enabled = true;
-        drop(config_write);
+        {
+            let mut config_write = self.config.write().await;
+            config_write.sync_enabled = true;
+        }
         self.save_config().await?;
         
         tracing::info!("All services started successfully");
@@ -200,15 +205,23 @@ impl ServiceManager {
         // Mark as not running first to prevent new operations
         *self.is_running.write().await = false;
         
+        // Stop WebSocket server explicitly
+        if let Some(ref ws) = self.websocket {
+            if let Err(e) = ws.stop().await {
+                tracing::error!("Failed to stop WebSocket server: {}", e);
+            }
+        }
+        
         // Services will be dropped automatically, stopping their background tasks
         self.websocket = None;
         self.mdns = None;
         self.clipboard = None;
         
         // Update config to reflect stopped state
-        let mut config = self.config.write().await;
-        config.sync_enabled = false;
-        drop(config);
+        {
+            let mut config = self.config.write().await;
+            config.sync_enabled = false;
+        }
         self.save_config().await?;
         
         tracing::info!("All services stopped");

@@ -2,12 +2,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures_util::{StreamExt, SinkExt};
 use std::sync::Arc;
-use tokio::sync::{RwLock};
+use tokio::sync::{RwLock, broadcast};
 use std::collections::HashMap;
 use uuid::Uuid;
 use anyhow::Result;
 use std::net::SocketAddr;
-use tokio::sync::broadcast;
 use crate::models::ClipboardMessage;
 
 type Tx = broadcast::Sender<String>;
@@ -17,19 +16,30 @@ pub struct WebSocketServer {
     port: u16,
     peers: PeerMap,
     tx: Tx,
+    shutdown_tx: broadcast::Sender<()>,
+    server_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl WebSocketServer {
     pub fn new(port: u16) -> Self {
         let (tx, _) = broadcast::channel(100);
+        let (shutdown_tx, _) = broadcast::channel(1);
         Self {
             port,
             peers: Arc::new(RwLock::new(HashMap::new())),
             tx,
+            shutdown_tx,
+            server_handle: Arc::new(RwLock::new(None)),
         }
     }
 
     pub async fn start(&self) -> Result<()> {
+        // Check if already running
+        if self.server_handle.read().await.is_some() {
+            tracing::warn!("WebSocket server is already running");
+            return Ok(());
+        }
+
         let addr = format!("127.0.0.1:{}", self.port);
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => l,
@@ -42,13 +52,49 @@ impl WebSocketServer {
 
         let peers = self.peers.clone();
         let tx = self.tx.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        tokio::spawn(async move {
-            while let Ok((stream, addr)) = listener.accept().await {
-                tokio::spawn(Self::handle_connection(stream, addr, peers.clone(), tx.clone()));
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        match result {
+                            Ok((stream, addr)) => {
+                                tokio::spawn(Self::handle_connection(stream, addr, peers.clone(), tx.clone()));
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to accept connection: {}", e);
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        tracing::info!("WebSocket server shutting down");
+                        break;
+                    }
+                }
             }
         });
 
+        *self.server_handle.write().await = Some(handle);
+        Ok(())
+    }
+
+    pub async fn stop(&self) -> Result<()> {
+        tracing::info!("Stopping WebSocket server on port {}", self.port);
+        
+        // Send shutdown signal
+        let _ = self.shutdown_tx.send(());
+        
+        // Wait for server task to finish
+        let mut handle_guard = self.server_handle.write().await;
+        if let Some(handle) = handle_guard.take() {
+            handle.abort();
+            tracing::info!("WebSocket server stopped");
+        }
+        
+        // Clear all peers
+        self.peers.write().await.clear();
+        
         Ok(())
     }
 

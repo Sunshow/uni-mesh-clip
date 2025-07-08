@@ -46,6 +46,19 @@
 - May need to handle clipboard format conversion between platforms
 - Should add connection retry logic with exponential backoff
 
+## Critical Bug Fixes - 2025-07-08
+- [x] **FIXED: Start button spinning issue** - 2025-07-08
+  - Root cause: Clipboard initialization blocking due to macOS permissions
+  - Root cause: WebSocket server not properly releasing ports on stop
+  - Solution: Added 5-second timeout for clipboard initialization
+  - Solution: Implemented proper WebSocket server shutdown mechanism
+  - Solution: Improved error handling with user-friendly messages
+  - Solution: Fixed state management race conditions
+  - Solution: Added detailed logging for debugging
+  - Result: Start button now responds within 5 seconds maximum
+  - Result: Proper port cleanup allows restart without "address in use" errors
+  - Result: App continues working even if clipboard permission denied
+
 ## Next Steps
 1. Install dependencies with `npm install`
 2. Set up development environment files

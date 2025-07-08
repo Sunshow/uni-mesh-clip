@@ -77,18 +77,21 @@ function App() {
     setIsToggling(true)
     
     try {
-      // Add timeout protection to prevent hanging
+      // Reduce timeout to 5 seconds to prevent long waits
       const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Operation timed out')), 10000)
+        setTimeout(() => reject(new Error('Operation timed out after 5 seconds')), 5000)
       )
       
       const toggleOperation = async () => {
         if (syncEnabled) {
           console.log('Stopping sync...')
           await invoke('stop_sync')
+          console.log('Stop sync command completed')
         } else {
           console.log('Starting sync...')
+          console.log('This may take a moment for clipboard permissions...')
           await invoke('start_sync')
+          console.log('Start sync command completed')
         }
       }
       
@@ -107,7 +110,18 @@ function App() {
     } catch (error) {
       console.error('Failed to toggle sync:', error)
       const errorMessage = error instanceof Error ? error.message : String(error)
-      alert(`Failed to ${syncEnabled ? 'stop' : 'start'} sync: ${errorMessage}`)
+      
+      // Provide more helpful error messages
+      let userMessage = errorMessage
+      if (errorMessage.includes('timed out')) {
+        userMessage = `Operation timed out. This often happens when:\n• Clipboard permissions are required (check System Preferences > Security & Privacy)\n• Port ${config.websocket_port} is already in use\n• Another instance is running`
+      } else if (errorMessage.includes('permission')) {
+        userMessage = `Permission denied. Please grant clipboard access in System Preferences > Security & Privacy > Privacy > Accessibility`
+      } else if (errorMessage.includes('bind') || errorMessage.includes('port')) {
+        userMessage = `Cannot start server on port ${config.websocket_port}. Try changing the port in settings or close other instances.`
+      }
+      
+      alert(`Failed to ${syncEnabled ? 'stop' : 'start'} sync:\n\n${userMessage}`)
       // Re-check status on error to ensure UI is in sync
       await checkSyncStatus()
     } finally {
