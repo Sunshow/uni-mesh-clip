@@ -8,7 +8,6 @@ use get_if_addrs::get_if_addrs;
 use std::net::Ipv4Addr;
 use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
 use std::net::IpAddr;
-use uuid::Uuid;
 
 const SERVICE_TYPE: &str = "_unimesh._tcp.local.";
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(10); // Check every 10 seconds
@@ -80,19 +79,60 @@ impl MdnsService {
     fn get_local_ip() -> Option<Ipv4Addr> {
         match get_if_addrs() {
             Ok(interfaces) => {
+                let mut candidates = Vec::new();
+                
                 for interface in interfaces {
                     if !interface.is_loopback() && interface.ip().is_ipv4() {
                         if let std::net::IpAddr::V4(ipv4) = interface.ip() {
-                            // Prefer private network addresses
                             if ipv4.is_private() {
-                                return Some(ipv4);
+                                candidates.push((interface.name.clone(), ipv4));
                             }
                         }
                     }
                 }
+                
+                // Log all candidates for debugging
+                if !candidates.is_empty() {
+                    tracing::info!("Available network interfaces for mDNS:");
+                    for (name, ip) in &candidates {
+                        tracing::info!("  - {}: {}", name, ip);
+                    }
+                }
+                
+                // Prefer specific interface types for better cross-platform compatibility
+                for (name, ip) in &candidates {
+                    // Prefer Ethernet interfaces first
+                    if name.to_lowercase().contains("eth") || 
+                       name.to_lowercase().contains("ethernet") ||
+                       name.to_lowercase().contains("en0") { // macOS ethernet
+                        tracing::info!("Selected ethernet interface: {} -> {}", name, ip);
+                        return Some(*ip);
+                    }
+                }
+                
+                // Then prefer Wi-Fi interfaces
+                for (name, ip) in &candidates {
+                    if name.to_lowercase().contains("wi-fi") ||
+                       name.to_lowercase().contains("wlan") ||
+                       name.to_lowercase().contains("wireless") ||
+                       name.to_lowercase().contains("en1") { // macOS Wi-Fi
+                        tracing::info!("Selected Wi-Fi interface: {} -> {}", name, ip);
+                        return Some(*ip);
+                    }
+                }
+                
+                // Finally, use the first available private IP
+                if let Some((name, ip)) = candidates.first() {
+                    tracing::info!("Selected first available interface: {} -> {}", name, ip);
+                    return Some(*ip);
+                }
+                
                 None
             }
-            Err(_) => None,
+            Err(e) => {
+                tracing::error!("Failed to get network interfaces: {}", e);
+                None
+            }
         }
     }
 
@@ -152,7 +192,7 @@ impl MdnsService {
                                         // Check if this is our own service
                                         let local_instance_name = local_instance.read().await;
                                         if let Some(ref local_name) = *local_instance_name {
-                                            if info.get_fullname() == local_name {
+                                            if info.get_fullname() == *local_name {
                                                 tracing::debug!("Ignoring our own service by instance name: {}", local_name);
                                                 continue;
                                             }
@@ -206,11 +246,32 @@ impl MdnsService {
                                     }
                                     ServiceEvent::ServiceRemoved(typ, fullname) => {
                                         tracing::info!("Service removed: {} ({})", fullname, typ);
+                                        
+                                        // Check if this is our own service being removed
+                                        let local_instance_name = local_instance.read().await;
+                                        if let Some(ref local_name) = *local_instance_name {
+                                            if fullname == *local_name {
+                                                tracing::warn!("Our own service was removed from mDNS: {}", fullname);
+                                                // Don't remove from discovered devices as it's our own service
+                                                continue;
+                                            }
+                                        }
+                                        
                                         // Remove from discovered devices
                                         let mut devices_write = devices.write().await;
+                                        let initial_count = devices_write.len();
                                         devices_write.retain(|_, (device, _)| {
-                                            device.name != fullname
+                                            let should_keep = device.name != fullname;
+                                            if !should_keep {
+                                                tracing::info!("Removed device from list: {} ({}:{})", 
+                                                             device.name, device.address, device.port);
+                                            }
+                                            should_keep
                                         });
+                                        let final_count = devices_write.len();
+                                        if initial_count != final_count {
+                                            tracing::info!("Updated device list: {} -> {} devices", initial_count, final_count);
+                                        }
                                     }
                                     ServiceEvent::SearchStarted(service_type) => {
                                         tracing::info!("mDNS search started for: {}", service_type);
@@ -328,18 +389,31 @@ impl MdnsService {
             }
         };
         
-        // Create service info with a unique instance name
-        let hostname = format!("{}.local.", hostname::get().unwrap_or_default().to_string_lossy());
-        let instance_name = format!("{}-{}", self.service_name, Uuid::new_v4().to_string()[..8].to_string());
+        // Create service info with a more predictable instance name for cross-platform compatibility
+        let hostname = hostname::get().unwrap_or_default().to_string_lossy().to_string();
+        let clean_hostname = if hostname.ends_with(".local") {
+            hostname.trim_end_matches(".local").to_string()
+        } else {
+            hostname
+        };
+        
+        // Use consistent instance name format for better cross-platform compatibility
+        let instance_name = format!("{}-{}", self.service_name, clean_hostname);
+        
+        // Add more metadata for better service identification
         let properties: &[(&str, &str)] = &[
             ("version", "1.0"),
             ("platform", std::env::consts::OS),
+            ("arch", std::env::consts::ARCH),
+            ("port", &self.port.to_string()),
         ];
+        
+        tracing::info!("Creating service with instance name: {} on host: {}.local.", instance_name, clean_hostname);
         
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
             &instance_name,
-            &hostname,
+            &format!("{}.local.", clean_hostname),
             &local_ip.to_string(),
             self.port,
             properties,
@@ -353,9 +427,14 @@ impl MdnsService {
         })?;
         
         // Store our instance name to filter it out from discovery
-        *self.local_instance_name.write().await = Some(instance_name.clone());
+        *self.local_instance_name.write().await = Some(format!("{}.{}", instance_name, SERVICE_TYPE));
         
-        tracing::info!("mDNS service published successfully with instance: {}", instance_name);
+        tracing::info!("mDNS service published successfully:");
+        tracing::info!("  - Instance: {}", instance_name);
+        tracing::info!("  - Full name: {}.{}", instance_name, SERVICE_TYPE);
+        tracing::info!("  - Host: {}.local.", clean_hostname);
+        tracing::info!("  - Address: {}:{}", local_ip, self.port);
+        tracing::info!("  - Platform: {} ({})", std::env::consts::OS, std::env::consts::ARCH);
         
         // Also immediately trigger discovery to find existing services
         tracing::info!("Triggering immediate discovery after service publication");
