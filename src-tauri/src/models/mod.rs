@@ -44,7 +44,7 @@ impl Default for Config {
             mdns_service_name: "unimesh-clip".to_string(),
             security_key: None,
             auto_start: true,
-            sync_enabled: true,
+            sync_enabled: false,
         }
     }
 }

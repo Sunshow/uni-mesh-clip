@@ -58,11 +58,26 @@ impl ServiceManager {
     pub async fn start(&mut self) -> Result<()> {
         tracing::info!("Starting services...");
         
-        if *self.is_running.read().await {
-            tracing::warn!("Services already running");
+        // Check if already running with detailed logging
+        let current_running = *self.is_running.read().await;
+        if current_running {
+            tracing::warn!("Services are already running, skipping start");
             return Ok(());
         }
 
+        // Double-check with a write lock to prevent race conditions
+        {
+            let mut running_lock = self.is_running.write().await;
+            if *running_lock {
+                tracing::warn!("Services started by another thread, skipping");
+                return Ok(());
+            }
+            
+            // Mark as starting to prevent other threads from starting
+            *running_lock = true;
+        }
+
+        // If we get here, we're the only thread starting services
         let config = self.config.read().await;
         tracing::info!("Starting with config: websocket_port={}, mdns_service_name={}", 
                       config.websocket_port, config.mdns_service_name);
@@ -70,17 +85,34 @@ impl ServiceManager {
         // Start WebSocket server
         tracing::info!("Starting WebSocket server on port {}", config.websocket_port);
         let ws = Arc::new(WebSocketServer::new(config.websocket_port));
-        ws.start().await?;
-        self.websocket = Some(ws.clone());
-        tracing::info!("WebSocket server started successfully");
+        match ws.start().await {
+            Ok(()) => {
+                self.websocket = Some(ws.clone());
+                tracing::info!("WebSocket server started successfully");
+            }
+            Err(e) => {
+                tracing::error!("Failed to start WebSocket server: {}", e);
+                // Reset running state on failure
+                *self.is_running.write().await = false;
+                return Err(e);
+            }
+        }
         
         // Start mDNS service
         let mdns = Arc::new(MdnsService::new(
             config.mdns_service_name.clone(),
             config.websocket_port,
         ));
-        mdns.start_discovery().await?;
-        mdns.publish_service().await?;
+        
+        if let Err(e) = mdns.start_discovery().await {
+            tracing::error!("Failed to start mDNS discovery: {}", e);
+            // Don't fail completely, just log the error
+        }
+        
+        if let Err(e) = mdns.publish_service().await {
+            tracing::error!("Failed to publish mDNS service: {}", e);
+            // Don't fail completely, just log the error
+        }
         
         // Add some sample devices for demonstration
         if cfg!(debug_assertions) {
@@ -107,7 +139,7 @@ impl ServiceManager {
         match ClipboardMonitor::new() {
             Ok(monitor) => {
                 let clipboard = Arc::new(monitor);
-                let ws_for_clipboard = ws.clone();
+                let ws_for_clipboard = self.websocket.as_ref().unwrap().clone();
                 let security_key = config.security_key.clone();
                 
                 // Start monitoring (it spawns its own task internally)
@@ -152,8 +184,6 @@ impl ServiceManager {
             }
         }
         
-        *self.is_running.write().await = true;
-        
         // Update config to reflect running state
         let mut config_write = self.config.write().await;
         config_write.sync_enabled = true;
@@ -165,6 +195,9 @@ impl ServiceManager {
     }
 
     pub async fn stop(&mut self) -> Result<()> {
+        tracing::info!("Stopping services...");
+        
+        // Mark as not running first to prevent new operations
         *self.is_running.write().await = false;
         
         // Services will be dropped automatically, stopping their background tasks
