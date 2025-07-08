@@ -23,22 +23,34 @@ impl ClipboardMonitor {
     {
         let clipboard = self.clipboard.clone();
         let last_content = self.last_content.clone();
+        let on_change = Arc::new(on_change);
         
-        let mut interval = interval(Duration::from_millis(500));
-        
-        loop {
-            interval.tick().await;
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_millis(500));
             
-            let mut clipboard = clipboard.lock().await;
-            if let Ok(text) = clipboard.get_text() {
-                let mut last = last_content.lock().await;
+            loop {
+                interval.tick().await;
                 
-                if last.as_ref() != Some(&text) {
-                    *last = Some(text.clone());
-                    on_change(text);
+                let mut clipboard = clipboard.lock().await;
+                match clipboard.get_text() {
+                    Ok(text) => {
+                        let mut last = last_content.lock().await;
+                        
+                        if last.as_ref() != Some(&text) && !text.is_empty() {
+                            *last = Some(text.clone());
+                            drop(last);
+                            drop(clipboard);
+                            on_change(text);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to get clipboard text: {}", e);
+                    }
                 }
             }
-        }
+        });
+        
+        Ok(())
     }
 
     pub async fn set_clipboard(&self, content: String) -> Result<()> {

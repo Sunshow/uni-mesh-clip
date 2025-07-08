@@ -30,8 +30,14 @@ impl WebSocketServer {
     }
 
     pub async fn start(&self) -> Result<()> {
-        let addr = format!("0.0.0.0:{}", self.port);
-        let listener = TcpListener::bind(&addr).await?;
+        let addr = format!("127.0.0.1:{}", self.port);
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to bind WebSocket server to {}: {}", addr, e);
+                return Err(e.into());
+            }
+        };
         tracing::info!("WebSocket server listening on {}", addr);
 
         let peers = self.peers.clone();

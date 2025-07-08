@@ -11,6 +11,11 @@ export const Settings: React.FC<SettingsProps> = ({ config, onSave }) => {
   const [formData, setFormData] = useState<Config>(config)
   const [saving, setSaving] = useState(false)
 
+  // Update form data when config prop changes
+  React.useEffect(() => {
+    setFormData(config)
+  }, [config])
+
   const handleChange = (field: keyof Config, value: any) => {
     setFormData(prev => ({ ...prev, [field]: value }))
   }

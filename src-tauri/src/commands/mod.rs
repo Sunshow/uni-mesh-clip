@@ -47,3 +47,8 @@ pub async fn add_test_device(device: DiscoveredDevice, state: State<'_, AppState
     manager.add_test_device(device).await
         .map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn test_connection() -> Result<String, String> {
+    Ok("Connection successful".to_string())
+}

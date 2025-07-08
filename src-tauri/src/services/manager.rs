@@ -56,16 +56,23 @@ impl ServiceManager {
     }
 
     pub async fn start(&mut self) -> Result<()> {
+        tracing::info!("Starting services...");
+        
         if *self.is_running.read().await {
+            tracing::warn!("Services already running");
             return Ok(());
         }
 
         let config = self.config.read().await;
+        tracing::info!("Starting with config: websocket_port={}, mdns_service_name={}", 
+                      config.websocket_port, config.mdns_service_name);
         
         // Start WebSocket server
+        tracing::info!("Starting WebSocket server on port {}", config.websocket_port);
         let ws = Arc::new(WebSocketServer::new(config.websocket_port));
         ws.start().await?;
         self.websocket = Some(ws.clone());
+        tracing::info!("WebSocket server started successfully");
         
         // Start mDNS service
         let mdns = Arc::new(MdnsService::new(
@@ -97,41 +104,53 @@ impl ServiceManager {
         self.mdns = Some(mdns.clone());
         
         // Start clipboard monitor
-        let clipboard = Arc::new(ClipboardMonitor::new()?);
-        let ws_for_clipboard = ws.clone();
-        let security_key = config.security_key.clone();
-        
-        clipboard.start_monitoring(move |content| {
-            let ws = ws_for_clipboard.clone();
-            let key = security_key.clone();
-            tokio::spawn(async move {
-                let mut message = ClipboardMessage {
-                    id: uuid::Uuid::new_v4(),
-                    msg_type: crate::models::MessageType::ClipboardUpdate,
-                    content: Some(content),
-                    timestamp: chrono::Utc::now(),
-                    signature: None,
-                    device: None,
-                };
+        match ClipboardMonitor::new() {
+            Ok(monitor) => {
+                let clipboard = Arc::new(monitor);
+                let ws_for_clipboard = ws.clone();
+                let security_key = config.security_key.clone();
                 
-                // Add signature if security key is set
-                if let Some(ref key) = key {
-                    let data = format!(
-                        "{}|{}|{}|{}",
-                        message.id,
-                        serde_json::to_string(&message.msg_type).unwrap(),
-                        message.content.as_ref().unwrap_or(&String::new()),
-                        message.timestamp.to_rfc3339()
-                    );
-                    message.signature = Some(crate::utils::crypto::generate_signature(key, &data));
+                // Start monitoring (it spawns its own task internally)
+                if let Err(e) = clipboard.start_monitoring(move |content| {
+                    let ws = ws_for_clipboard.clone();
+                    let key = security_key.clone();
+                    tokio::spawn(async move {
+                        let mut message = ClipboardMessage {
+                            id: uuid::Uuid::new_v4(),
+                            msg_type: crate::models::MessageType::ClipboardUpdate,
+                            content: Some(content),
+                            timestamp: chrono::Utc::now(),
+                            signature: None,
+                            device: None,
+                        };
+                        
+                        // Add signature if security key is set
+                        if let Some(ref key) = key {
+                            let data = format!(
+                                "{}|{}|{}|{}",
+                                message.id,
+                                serde_json::to_string(&message.msg_type).unwrap(),
+                                message.content.as_ref().unwrap_or(&String::new()),
+                                message.timestamp.to_rfc3339()
+                            );
+                            message.signature = Some(crate::utils::crypto::generate_signature(key, &data));
+                        }
+                        
+                        if let Err(e) = ws.broadcast_message(message).await {
+                            tracing::error!("Failed to broadcast clipboard update: {}", e);
+                        }
+                    });
+                }).await {
+                    tracing::error!("Failed to start clipboard monitoring: {}", e);
                 }
                 
-                if let Err(e) = ws.broadcast_message(message).await {
-                    tracing::error!("Failed to broadcast clipboard update: {}", e);
-                }
-            });
-        }).await?;
-        self.clipboard = Some(clipboard);
+                self.clipboard = Some(clipboard);
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize clipboard monitor: {}. Clipboard sync will be disabled.", e);
+                // Continue without clipboard monitoring
+            }
+        }
         
         *self.is_running.write().await = true;
         
