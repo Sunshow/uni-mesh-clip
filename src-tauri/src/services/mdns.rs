@@ -11,9 +11,9 @@ use std::net::IpAddr;
 use uuid::Uuid;
 
 const SERVICE_TYPE: &str = "_unimesh._tcp.local.";
-const DISCOVERY_INTERVAL: Duration = Duration::from_secs(10); // Increased for more frequent discovery
-const ACTIVE_QUERY_INTERVAL: Duration = Duration::from_secs(30); // New: periodic active queries
-const DEVICE_TIMEOUT: Duration = Duration::from_secs(60); // Increased timeout
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(10); // Check every 10 seconds
+const ACTIVE_QUERY_INTERVAL: Duration = Duration::from_secs(30); // Active query every 30 seconds
+const DEVICE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes timeout (increased from 60 seconds)
 
 pub struct MdnsService {
     service_name: String,
@@ -36,7 +36,48 @@ impl MdnsService {
         }
     }
 
-    /// Get the local IP address for mDNS publishing
+    /// Get all local IP addresses for filtering
+    fn get_all_local_ips() -> Vec<IpAddr> {
+        match get_if_addrs() {
+            Ok(interfaces) => {
+                let mut local_ips = Vec::new();
+                for interface in interfaces {
+                    let ip = interface.ip();
+                    // Include all local IPs: loopback, private, and link-local
+                    if ip.is_loopback() || 
+                       (ip.is_ipv4() && interface.ip().to_string().starts_with("127.")) ||
+                       (ip.is_ipv4() && Self::is_private_ipv4(&ip)) ||
+                       (ip.is_ipv6() && Self::is_local_ipv6(&ip)) {
+                        local_ips.push(ip);
+                    }
+                }
+                local_ips
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+    
+    /// Check if IPv4 address is private
+    fn is_private_ipv4(ip: &IpAddr) -> bool {
+        if let IpAddr::V4(ipv4) = ip {
+            ipv4.is_private()
+        } else {
+            false
+        }
+    }
+    
+    /// Check if IPv6 address is local (link-local or loopback)
+    fn is_local_ipv6(ip: &IpAddr) -> bool {
+        if let IpAddr::V6(ipv6) = ip {
+            ipv6.is_loopback() || 
+            ipv6.to_string().starts_with("fe80") || // Link-local
+            ipv6.to_string().starts_with("::1")     // Loopback
+        } else {
+            false
+        }
+    }
+
+    /// Get the preferred local IPv4 address for mDNS publishing
     fn get_local_ip() -> Option<Ipv4Addr> {
         match get_if_addrs() {
             Ok(interfaces) => {
@@ -71,6 +112,7 @@ impl MdnsService {
         let service_type = SERVICE_TYPE.to_string();
         let local_instance = self.local_instance_name.clone();
         let local_port = self.port;
+        let all_local_ips = Self::get_all_local_ips(); // Get all local IPs for filtering
         
         let handle = tokio::spawn(async move {
             tracing::info!("Starting mDNS discovery for service: {}", service_type);
@@ -113,21 +155,28 @@ impl MdnsService {
                                         let local_instance_name = local_instance.read().await;
                                         if let Some(ref local_name) = *local_instance_name {
                                             if info.get_fullname() == local_name {
-                                                tracing::debug!("Ignoring our own service: {}", local_name);
+                                                tracing::debug!("Ignoring our own service by instance name: {}", local_name);
                                                 continue;
                                             }
                                         }
                                         
-                                        // Also check by port - if same port and local IP, it's likely us
-                                        if let Some(addr) = info.get_addresses().iter().next() {
-                                            if info.get_port() == local_port {
-                                                if let Some(local_ip) = Self::get_local_ip() {
-                                                    if addr.to_string() == local_ip.to_string() {
-                                                        tracing::debug!("Ignoring our own service by IP:port match: {}:{}", addr, info.get_port());
-                                                        continue;
-                                                    }
+                                        // Check if any discovered address matches our local IPs
+                                        let mut is_local_service = false;
+                                        for discovered_addr in info.get_addresses() {
+                                            for local_ip in &all_local_ips {
+                                                if discovered_addr == local_ip && info.get_port() == local_port {
+                                                    tracing::debug!("Ignoring our own service by IP:port match: {}:{}", discovered_addr, info.get_port());
+                                                    is_local_service = true;
+                                                    break;
                                                 }
                                             }
+                                            if is_local_service {
+                                                break;
+                                            }
+                                        }
+                                        
+                                        if is_local_service {
+                                            continue;
                                         }
                                         
                                         // Convert to DiscoveredDevice
@@ -143,14 +192,17 @@ impl MdnsService {
                                             let mut devices_write = devices.write().await;
                                             let key = format!("{}:{}", device.address, device.port);
                                             
-                                            // Check if device already exists, if so update timestamp
-                                            if let Some((existing_device, _)) = devices_write.get_mut(&key) {
+                                            // Check if device already exists, update both timestamps
+                                            if let Some((existing_device, last_instant)) = devices_write.get_mut(&key) {
+                                                // Update both chrono timestamp and Instant
                                                 existing_device.last_seen = chrono::Utc::now();
-                                                tracing::debug!("Updated existing device timestamp: {}", key);
+                                                *last_instant = Instant::now();
+                                                tracing::debug!("Updated existing device timestamps: {} -> {}", key, existing_device.name);
                                             } else {
+                                                let device_name = device.name.clone();
                                                 let device_info = format!("{}:{}", device.address, device.port);
                                                 devices_write.insert(key, (device, Instant::now()));
-                                                tracing::info!("Added new device to discovered list: {}", device_info);
+                                                tracing::info!("Added new device to discovered list: {} -> {}", device_info, device_name);
                                             }
                                         }
                                     }
@@ -186,23 +238,36 @@ impl MdnsService {
                         // Clean up stale devices - only remove devices that haven't been seen for the timeout period
                         let mut devices_write = devices.write().await;
                         let initial_count = devices_write.len();
+                        
+                        // First, log all current devices for debugging
+                        if initial_count > 0 {
+                            tracing::debug!("Current devices before cleanup ({}): ", initial_count);
+                            for (key, (device, last_seen)) in devices_write.iter() {
+                                tracing::debug!("  - {}: {} ({:?} ago)", 
+                                               key, device.name, last_seen.elapsed());
+                            }
+                        }
+                        
                         devices_write.retain(|_key, (device, last_seen)| {
                             let should_keep = last_seen.elapsed() < DEVICE_TIMEOUT;
                             if !should_keep {
-                                tracing::info!("Removing stale device: {} ({}:{}) - last seen {:?} ago", 
-                                             device.name, device.address, device.port, last_seen.elapsed());
+                                tracing::warn!("Removing stale device: {} ({}:{}) - last seen {:?} ago (timeout: {:?})", 
+                                             device.name, device.address, device.port, last_seen.elapsed(), DEVICE_TIMEOUT);
                             }
                             should_keep
                         });
+                        
                         let final_count = devices_write.len();
                         if initial_count != final_count {
-                            tracing::info!("Cleaned up {} stale devices ({} -> {} devices)", 
-                                         initial_count - final_count, initial_count, final_count);
+                            tracing::info!("Device cleanup completed: {} removed, {} remaining (was {}, now {})", 
+                                         initial_count - final_count, final_count, initial_count, final_count);
+                        } else if initial_count > 0 {
+                            tracing::debug!("No devices removed in cleanup cycle, {} devices still active", initial_count);
                         }
                         
-                        // Trigger periodic active queries to discover new devices
+                        // Trigger periodic active queries to discover new devices and refresh existing ones
                         if last_active_query.elapsed() >= ACTIVE_QUERY_INTERVAL {
-                            tracing::debug!("Triggering periodic active discovery query");
+                            tracing::debug!("Triggering periodic active discovery query (every {:?})", ACTIVE_QUERY_INTERVAL);
                             // Create a new browse request to actively search for services
                             if let Ok(_new_receiver) = mdns_daemon.browse(&service_type) {
                                 tracing::debug!("Successfully triggered active browse");
