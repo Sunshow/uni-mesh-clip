@@ -32,7 +32,9 @@
       "Bash(./test_fix.sh:*)",
       "Bash(/Users/sunshow/GIT/sunshow/uni-mesh-clip/test_fix.sh:*)",
       "Bash(rustup target:*)",
-      "Bash(brew install:*)"
+      "Bash(brew install:*)",
+      "Bash(magick:*)",
+      "Bash(cp:*)"
     ],
     "deny": []
   }

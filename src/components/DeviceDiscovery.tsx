@@ -7,12 +7,24 @@ export const DeviceDiscovery: React.FC = () => {
   const [loading, setLoading] = useState(true)
   const [showAddDevice, setShowAddDevice] = useState(false)
   const [newDevice, setNewDevice] = useState({ name: '', address: '', port: '8765' })
+  const [isDevMode, setIsDevMode] = useState(false)
 
   useEffect(() => {
     loadDevices()
+    checkDevMode()
     const interval = setInterval(loadDevices, 2000) // Update every 2 seconds
     return () => clearInterval(interval)
   }, [])
+
+  const checkDevMode = async () => {
+    try {
+      const devMode = await invoke<boolean>('is_dev_mode')
+      setIsDevMode(devMode)
+    } catch (error) {
+      console.error('Failed to check dev mode:', error)
+      setIsDevMode(false)
+    }
+  }
 
   const loadDevices = async () => {
     try {
@@ -76,9 +88,11 @@ export const DeviceDiscovery: React.FC = () => {
           <p>No devices found on the network</p>
           <p className="hint">Make sure other devices are running UniMesh Clip and are on the same network</p>
         </div>
-        <div className="device-actions">
-          <button onClick={() => setShowAddDevice(true)}>Add Test Device</button>
-        </div>
+        {isDevMode && (
+          <div className="device-actions">
+            <button onClick={() => setShowAddDevice(true)}>Add Test Device</button>
+          </div>
+        )}
       </div>
     )
   }
@@ -109,13 +123,15 @@ export const DeviceDiscovery: React.FC = () => {
         })}
       </div>
       
-      <div className="device-actions">
-        <button onClick={() => setShowAddDevice(!showAddDevice)}>
-          {showAddDevice ? 'Cancel' : 'Add Test Device'}
-        </button>
-      </div>
+      {isDevMode && (
+        <div className="device-actions">
+          <button onClick={() => setShowAddDevice(!showAddDevice)}>
+            {showAddDevice ? 'Cancel' : 'Add Test Device'}
+          </button>
+        </div>
+      )}
       
-      {showAddDevice && (
+      {showAddDevice && isDevMode && (
         <div className="add-device-form">
           <div className="form-group">
             <label>Device Name</label>

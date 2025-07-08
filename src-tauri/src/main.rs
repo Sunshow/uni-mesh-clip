@@ -62,6 +62,7 @@ fn main() {
             commands::get_sync_status,
             commands::add_test_device,
             commands::test_connection,
+            commands::is_dev_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

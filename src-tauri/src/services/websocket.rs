@@ -47,7 +47,8 @@ impl WebSocketServer {
             return Ok(());
         }
 
-        let addr = format!("127.0.0.1:{}", self.port);
+        // Bind to all interfaces to allow cross-device connections
+        let addr = format!("0.0.0.0:{}", self.port);
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -55,7 +56,7 @@ impl WebSocketServer {
                 return Err(e.into());
             }
         };
-        tracing::info!("WebSocket server listening on {}", addr);
+        tracing::info!("WebSocket server listening on {} (all interfaces)", addr);
 
         let peers = self.peers.clone();
         let tx = self.tx.clone();

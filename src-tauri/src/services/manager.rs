@@ -216,6 +216,13 @@ impl ServiceManager {
         // Mark as not running first to prevent new operations
         *self.is_running.write().await = false;
         
+        // Stop mDNS discovery explicitly
+        if let Some(ref mdns) = self.mdns {
+            if let Err(e) = mdns.stop_discovery().await {
+                tracing::error!("Failed to stop mDNS discovery: {}", e);
+            }
+        }
+        
         // Stop WebSocket server explicitly
         if let Some(ref ws) = self.websocket {
             if let Err(e) = ws.stop().await {
