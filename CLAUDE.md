@@ -99,3 +99,9 @@
 - **Never delete or overwrite existing code** unless explicitly instructed to or if part of a task from `TASK.md`.
 - **Check Tauri 2.0 documentation** for breaking changes from v1 when working with existing projects.
 - **Verify frontend-backend type consistency** when creating or modifying data structures.
+
+### 📝 Git Commit Rules
+- **NEVER add Claude Code promotional content** to commit messages
+- **NEVER add Co-Authored-By: Claude** to commit messages
+- **Keep commit messages clean and professional** without AI attribution
+- **Follow conventional commit format** when possible (feat:, fix:, docs:, etc.)
