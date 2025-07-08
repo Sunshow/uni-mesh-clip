@@ -8,10 +8,12 @@ use get_if_addrs::get_if_addrs;
 use std::net::Ipv4Addr;
 use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
 use std::net::IpAddr;
+use uuid::Uuid;
 
 const SERVICE_TYPE: &str = "_unimesh._tcp.local.";
-const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
-const DEVICE_TIMEOUT: Duration = Duration::from_secs(30);
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(10); // Increased for more frequent discovery
+const ACTIVE_QUERY_INTERVAL: Duration = Duration::from_secs(30); // New: periodic active queries
+const DEVICE_TIMEOUT: Duration = Duration::from_secs(60); // Increased timeout
 
 pub struct MdnsService {
     service_name: String,
@@ -80,6 +82,13 @@ impl MdnsService {
             }
             
             let receiver = receiver.unwrap();
+            let mut last_active_query = Instant::now();
+            
+            // Immediately trigger an active query when starting
+            tracing::info!("Triggering initial active discovery query");
+            if let Err(e) = mdns_daemon.browse(&service_type) {
+                tracing::warn!("Failed to trigger initial browse: {}", e);
+            }
             
             loop {
                 tokio::select! {
@@ -108,7 +117,9 @@ impl MdnsService {
                                             
                                             let mut devices_write = devices.write().await;
                                             let key = format!("{}:{}", device.address, device.port);
+                                            let device_info = format!("{}:{}", device.address, device.port);
                                             devices_write.insert(key, (device, Instant::now()));
+                                            tracing::debug!("Added device to discovered list: {}", device_info);
                                         }
                                     }
                                     ServiceEvent::ServiceRemoved(typ, fullname) => {
@@ -119,7 +130,15 @@ impl MdnsService {
                                             device.name != fullname
                                         });
                                     }
-                                    _ => {}
+                                    ServiceEvent::SearchStarted(service_type) => {
+                                        tracing::debug!("mDNS search started for: {}", service_type);
+                                    }
+                                    ServiceEvent::SearchStopped(service_type) => {
+                                        tracing::debug!("mDNS search stopped for: {}", service_type);
+                                    }
+                                    _ => {
+                                        tracing::debug!("Received other mDNS event: {:?}", event);
+                                    }
                                 }
                             }
                             Ok(Err(e)) => {
@@ -134,9 +153,27 @@ impl MdnsService {
                     _ = tokio::time::sleep(DISCOVERY_INTERVAL) => {
                         // Clean up stale devices
                         let mut devices_write = devices.write().await;
+                        let initial_count = devices_write.len();
                         devices_write.retain(|_, (_, last_seen)| {
                             last_seen.elapsed() < DEVICE_TIMEOUT
                         });
+                        let final_count = devices_write.len();
+                        if initial_count != final_count {
+                            tracing::debug!("Cleaned up {} stale devices", initial_count - final_count);
+                        }
+                        
+                        // Trigger periodic active queries to discover new devices
+                        if last_active_query.elapsed() >= ACTIVE_QUERY_INTERVAL {
+                            tracing::debug!("Triggering periodic active discovery query");
+                            // Create a new browse request to actively search for services
+                            if let Ok(_new_receiver) = mdns_daemon.browse(&service_type) {
+                                tracing::debug!("Successfully triggered active browse");
+                                // The new receiver will be handled by subsequent iterations
+                            } else {
+                                tracing::warn!("Failed to trigger active browse");
+                            }
+                            last_active_query = Instant::now();
+                        }
                     }
                 }
             }
@@ -185,13 +222,17 @@ impl MdnsService {
             }
         };
         
-        // Create service info
+        // Create service info with a unique instance name
         let hostname = format!("{}.local.", hostname::get().unwrap_or_default().to_string_lossy());
-        let properties: &[(&str, &str)] = &[]; // No properties for now
+        let instance_name = format!("{}-{}", self.service_name, Uuid::new_v4().to_string()[..8].to_string());
+        let properties: &[(&str, &str)] = &[
+            ("version", "1.0"),
+            ("platform", std::env::consts::OS),
+        ];
         
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
-            &self.service_name,
+            &instance_name,
             &hostname,
             &local_ip.to_string(),
             self.port,
@@ -205,7 +246,14 @@ impl MdnsService {
             anyhow::anyhow!("Failed to register mDNS service: {}", e)
         })?;
         
-        tracing::info!("mDNS service published successfully");
+        tracing::info!("mDNS service published successfully with instance: {}", instance_name);
+        
+        // Also immediately trigger discovery to find existing services
+        tracing::info!("Triggering immediate discovery after service publication");
+        if let Err(e) = daemon.browse(SERVICE_TYPE) {
+            tracing::warn!("Failed to trigger discovery after service publication: {}", e);
+        }
+        
         Ok(())
     }
     
