@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 use crate::models::DiscoveredDevice;
 use get_if_addrs::get_if_addrs;
 use std::net::Ipv4Addr;
+use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
+use std::net::IpAddr;
 
-const SERVICE_TYPE: &str = "_unimesh._tcp.local";
+const SERVICE_TYPE: &str = "_unimesh._tcp.local.";
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -16,6 +18,7 @@ pub struct MdnsService {
     port: u16,
     discovered_devices: Arc<RwLock<HashMap<String, (DiscoveredDevice, Instant)>>>,
     discovery_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    mdns_daemon: Arc<RwLock<Option<ServiceDaemon>>>,
 }
 
 impl MdnsService {
@@ -25,6 +28,7 @@ impl MdnsService {
             port,
             discovered_devices: Arc::new(RwLock::new(HashMap::new())),
             discovery_handle: Arc::new(RwLock::new(None)),
+            mdns_daemon: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -52,36 +56,89 @@ impl MdnsService {
         // Stop existing discovery if running
         self.stop_discovery().await?;
         
+        // Create mDNS daemon
+        let mdns_daemon = ServiceDaemon::new().map_err(|e| {
+            anyhow::anyhow!("Failed to create mDNS daemon: {}", e)
+        })?;
+        
+        *self.mdns_daemon.write().await = Some(mdns_daemon.clone());
+        
         let devices = self.discovered_devices.clone();
+        let service_type = SERVICE_TYPE.to_string();
         
         let handle = tokio::spawn(async move {
-            tracing::info!("Starting mDNS discovery for service: {}", SERVICE_TYPE);
+            tracing::info!("Starting mDNS discovery for service: {}", service_type);
+            
+            // Browse for services
+            let receiver = mdns_daemon.browse(&service_type).map_err(|e| {
+                tracing::error!("Failed to start mDNS browse: {}", e);
+                e
+            });
+            
+            if let Err(_) = receiver {
+                return;
+            }
+            
+            let receiver = receiver.unwrap();
             
             loop {
-                match Self::discover_services().await {
-                    Ok(discovered) => {
-                        let mut devices_write = devices.write().await;
-                        let now = Instant::now();
-                        
-                        // Add newly discovered devices
-                        for device in discovered {
-                            let key = format!("{}:{}", device.address, device.port);
-                            devices_write.insert(key, (device, now));
+                tokio::select! {
+                    event = tokio::task::spawn_blocking({
+                        let receiver = receiver.clone();
+                        move || receiver.recv()
+                    }) => {
+                        match event {
+                            Ok(Ok(event)) => {
+                                match event {
+                                    ServiceEvent::ServiceResolved(info) => {
+                                        tracing::info!("Discovered service: {} at {}:{}", 
+                                                      info.get_fullname(), 
+                                                      info.get_addresses().iter().next().unwrap_or(&IpAddr::from([0,0,0,0])), 
+                                                      info.get_port());
+                                        
+                                        // Convert to DiscoveredDevice
+                                        if let Some(addr) = info.get_addresses().iter().next() {
+                                            let device = DiscoveredDevice {
+                                                name: info.get_fullname().to_string(),
+                                                address: addr.to_string(),
+                                                port: info.get_port(),
+                                                last_seen: chrono::Utc::now(),
+                                                trusted: false, // New devices are not trusted by default
+                                            };
+                                            
+                                            let mut devices_write = devices.write().await;
+                                            let key = format!("{}:{}", device.address, device.port);
+                                            devices_write.insert(key, (device, Instant::now()));
+                                        }
+                                    }
+                                    ServiceEvent::ServiceRemoved(typ, fullname) => {
+                                        tracing::info!("Service removed: {} ({})", fullname, typ);
+                                        // Remove from discovered devices
+                                        let mut devices_write = devices.write().await;
+                                        devices_write.retain(|_, (device, _)| {
+                                            device.name != fullname
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!("mDNS discovery error: {}", e);
+                            }
+                            Err(e) => {
+                                tracing::error!("mDNS task error: {}", e);
+                                break;
+                            }
                         }
-                        
+                    }
+                    _ = tokio::time::sleep(DISCOVERY_INTERVAL) => {
                         // Clean up stale devices
+                        let mut devices_write = devices.write().await;
                         devices_write.retain(|_, (_, last_seen)| {
                             last_seen.elapsed() < DEVICE_TIMEOUT
                         });
-                        
-                        drop(devices_write);
-                    }
-                    Err(e) => {
-                        tracing::warn!("mDNS discovery error: {}", e);
                     }
                 }
-                
-                tokio::time::sleep(DISCOVERY_INTERVAL).await;
             }
         });
         
@@ -95,21 +152,16 @@ impl MdnsService {
             handle.abort();
             tracing::info!("Stopped mDNS discovery");
         }
+        
+        // Stop the mDNS daemon
+        let mut daemon_guard = self.mdns_daemon.write().await;
+        if let Some(daemon) = daemon_guard.take() {
+            daemon.shutdown().map_err(|e| {
+                anyhow::anyhow!("Failed to shutdown mDNS daemon: {}", e)
+            })?;
+        }
+        
         Ok(())
-    }
-
-    async fn discover_services() -> Result<Vec<DiscoveredDevice>> {
-        let discovered = Vec::new();
-        
-        // For now, use a simplified discovery approach
-        // The mdns crate has some API complexities, so we'll implement basic discovery
-        tracing::debug!("Running mDNS discovery cycle for: {}", SERVICE_TYPE);
-        
-        // In a full implementation, we would use mdns::discover::all() properly
-        // For now, return empty list to avoid compilation issues
-        // TODO: Implement proper mDNS discovery when mdns crate API is stable
-        
-        Ok(discovered)
     }
 
     pub async fn publish_service(&self) -> Result<()> {
@@ -119,11 +171,41 @@ impl MdnsService {
         tracing::info!("Publishing mDNS service: {} on {}:{}", 
                       self.service_name, local_ip, self.port);
         
-        // For now, we'll log the service publication
-        // The mdns crate discovery functionality is more limited for publishing
-        // In a full implementation, we'd use a more complete mDNS library
-        tracing::info!("mDNS service would be published here - using discovery for now");
+        // Get or create mDNS daemon
+        let daemon = {
+            let mut daemon_guard = self.mdns_daemon.write().await;
+            if daemon_guard.is_none() {
+                let new_daemon = ServiceDaemon::new().map_err(|e| {
+                    anyhow::anyhow!("Failed to create mDNS daemon for publishing: {}", e)
+                })?;
+                *daemon_guard = Some(new_daemon.clone());
+                new_daemon
+            } else {
+                daemon_guard.as_ref().unwrap().clone()
+            }
+        };
         
+        // Create service info
+        let hostname = format!("{}.local.", hostname::get().unwrap_or_default().to_string_lossy());
+        let properties: &[(&str, &str)] = &[]; // No properties for now
+        
+        let service_info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &self.service_name,
+            &hostname,
+            &local_ip.to_string(),
+            self.port,
+            properties,
+        ).map_err(|e| {
+            anyhow::anyhow!("Failed to create service info: {}", e)
+        })?;
+        
+        // Register the service
+        daemon.register(service_info).map_err(|e| {
+            anyhow::anyhow!("Failed to register mDNS service: {}", e)
+        })?;
+        
+        tracing::info!("mDNS service published successfully");
         Ok(())
     }
     
