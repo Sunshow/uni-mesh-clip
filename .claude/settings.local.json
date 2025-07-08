@@ -27,7 +27,12 @@
       "Bash(npm run build:*)",
       "Bash(RUST_BACKTRACE=1 ./target/debug/uni-mesh-clip 2>&1)",
       "Bash(open:*)",
-      "Bash(true)"
+      "Bash(true)",
+      "Bash(chmod:*)",
+      "Bash(./test_fix.sh:*)",
+      "Bash(/Users/sunshow/GIT/sunshow/uni-mesh-clip/test_fix.sh:*)",
+      "Bash(rustup target:*)",
+      "Bash(brew install:*)"
     ],
     "deny": []
   }

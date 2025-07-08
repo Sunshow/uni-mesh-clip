@@ -10,6 +10,7 @@
     "tauri": "cd src-tauri && tauri",
     "tauri:dev": "cd src-tauri && tauri dev",
     "tauri:build": "cd src-tauri && tauri build",
+    "tauri:build:windows": "echo 'Use GitHub Actions for Windows builds: gh workflow run build-windows.yml'",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0"
   },
