@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use anyhow::Result;
-use crate::models::{Config, DiscoveredDevice, ClipboardMessage};
+use crate::models::{Config, DiscoveredDevice, ClipboardMessage, SyncMetrics};
 use super::{websocket::WebSocketServer, mdns::MdnsService, clipboard::ClipboardMonitor};
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
@@ -135,7 +135,18 @@ impl ServiceManager {
             Ok(monitor) => {
                 let clipboard = Arc::new(monitor);
                 let ws_for_clipboard = self.websocket.as_ref().unwrap().clone();
+                let clipboard_for_ws = clipboard.clone();
                 let security_key = config.security_key.clone();
+                
+                // Set up WebSocket callback to update clipboard
+                ws_for_clipboard.set_clipboard_callback(move |content| {
+                    let clipboard_clone = clipboard_for_ws.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = clipboard_clone.set_clipboard(content).await {
+                            tracing::error!("Failed to update clipboard from network: {}", e);
+                        }
+                    });
+                }).await;
                 
                 // Start monitoring (it spawns its own task internally)
                 match clipboard.start_monitoring(move |content| {
@@ -269,6 +280,14 @@ impl ServiceManager {
             Ok(())
         } else {
             Err(anyhow::anyhow!("mDNS service not running"))
+        }
+    }
+
+    pub async fn get_sync_metrics(&self) -> Option<SyncMetrics> {
+        if let Some(ref ws) = self.websocket {
+            Some(ws.get_sync_metrics().await)
+        } else {
+            None
         }
     }
 }

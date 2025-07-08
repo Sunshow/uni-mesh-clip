@@ -45,12 +45,40 @@ npm run tauri build
 
 ## Development
 
-Run in development mode:
+### Quick Start
+Use the convenient development script:
 ```bash
-npm run tauri dev
+./dev.sh
+```
+
+### Manual Development
+Alternatively, use npm scripts:
+```bash
+# Option 1: Direct Tauri command (from project root)
+npm run tauri:dev
+
+# Option 2: Navigate to src-tauri directory
+cd src-tauri
+npx tauri dev
 ```
 
 This will start both the Vite dev server and the Tauri application with hot reload.
+
+### Development Notes
+- **First run**: Rust dependencies will be downloaded and compiled (may take several minutes)
+- **Frontend**: Available at http://localhost:1420
+- **WebSocket**: Server runs on ws://localhost:8765
+- **Hot reload**: Frontend changes are reflected immediately
+- **Rust changes**: Trigger automatic recompilation
+
+### Development Scripts
+```bash
+npm run dev          # Start frontend dev server only
+npm run tauri:dev    # Start full Tauri development environment
+npm run tauri:build  # Build production application
+npm run typecheck    # TypeScript type checking
+npm run lint         # ESLint code quality check
+```
 
 ## Configuration
 
@@ -103,17 +131,17 @@ Edit `.env` file to customize:
 
 ### Windows
 ```bash
-npm run tauri build -- --target x86_64-pc-windows-msvc
+npm run tauri:build -- --target x86_64-pc-windows-msvc
 ```
 
 ### macOS
 ```bash
-npm run tauri build -- --target universal-apple-darwin
+npm run tauri:build -- --target universal-apple-darwin
 ```
 
 ### Linux
 ```bash
-npm run tauri build -- --target x86_64-unknown-linux-gnu
+npm run tauri:build -- --target x86_64-unknown-linux-gnu
 ```
 
 ## Network Requirements
